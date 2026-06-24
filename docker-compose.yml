@@ -1,0 +1,427 @@
+# =================================================================
+#  LAGO DE DATOS FEDERADO — 3 NODOS SIMULADOS
+#
+#  node-control    → Airflow + Hive Metastore + PostgreSQL
+#  node-processing → Spark Master + MinIO (Bronze/Silver/Gold) + JupyterLab
+#  node-serving    → Spark Worker + Trino
+#
+#  Almacenamiento unificado:
+#  - Un solo MinIO con buckets: bronze, silver, gold, lineage
+#  - Hive Metastore como catálogo único para las capas
+# =================================================================
+
+networks:
+  datalake-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:
+  jupyter-work:
+  cloudbeaver-data:
+
+services:
+
+  # ───────────────────────────────────────────────────────────────
+  #  NODE-CONTROL
+  # ───────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:13
+    container_name: node-control--postgres
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init/postgres_init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - datalake-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  hive-metastore:
+    image: apache/hive:3.1.3
+    container_name: node-control--hive
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      IS_RESUME: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+        -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER}
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+        -Dhive.metastore.warehouse.dir=s3a://bronze/warehouse
+        -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        -Dfs.s3a.endpoint=http://minio:9000
+        -Dfs.s3a.endpoint.region=us-east-1
+        -Dfs.s3a.access.key=${MINIO_ROOT_USER}
+        -Dfs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+        -Dfs.s3a.path.style.access=true
+        -Dfs.s3a.connection.ssl.enabled=false
+        -Dfs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+        -Dfs.s3a.change.detection.mode=none
+        -Dfs.s3a.connection.establish.timeout=5000
+        -Dfs.s3a.connection.timeout=10000
+        -Dfs.s3a.attempts.maximum=3
+    volumes:
+      - ./jars:/opt/hive/auxlib
+      - ./jars/hadoop-aws-3.1.0.jar:/opt/hive/lib/hadoop-aws-3.1.0.jar
+      - ./jars/aws-java-sdk-bundle-1.11.271.jar:/opt/hive/lib/aws-java-sdk-bundle-1.11.271.jar
+      - ./jars/hadoop-aws-3.1.0.jar:/opt/hadoop/share/hadoop/tools/lib/hadoop-aws-3.1.0.jar
+      - ./jars/aws-java-sdk-bundle-1.11.271.jar:/opt/hadoop/share/hadoop/tools/lib/aws-java-sdk-bundle-1.11.271.jar
+      - ./config/hive/core-site.xml:/opt/hive/conf/core-site.xml
+      - ./config/hive/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+    command: >
+      sh -c "
+      rm -f /opt/hadoop/share/hadoop/common/lib/guava-11.0.2.jar &&
+      rm -f /opt/hadoop/share/hadoop/hdfs/lib/guava-11.0.2.jar &&
+      cp /opt/hive/lib/guava-19.0.jar /opt/hadoop/share/hadoop/common/lib/guava-19.0.jar &&
+      cp /opt/hive/lib/guava-19.0.jar /opt/hadoop/share/hadoop/hdfs/lib/guava-19.0.jar &&
+      /entrypoint.sh
+      "
+    ports:
+      - "9083:9083"
+    networks:
+      - datalake-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: airflow-custom:latest
+    container_name: node-control--airflow-init
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username admin --password admin123 --firstname Admin --lastname Lake --role Admin --email admin@datalake.local || true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - datalake-net
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: airflow-custom:latest
+    container_name: node-control--airflow-web
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: supersecretkey123
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./lineage_engine:/opt/airflow/lineage_engine
+      - ./jars:/opt/airflow/jars
+    ports:
+      - "8080:8080"
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - datalake-net
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: airflow-custom:latest
+    container_name: node-control--airflow-scheduler
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./lineage_engine:/opt/airflow/lineage_engine
+      - ./jars:/opt/airflow/jars
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - datalake-net
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────────
+  #  NODE-PROCESSING
+  # ───────────────────────────────────────────────────────────────
+
+  minio:
+    image: minio/minio:latest
+    container_name: node-processing--minio
+    env_file: .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - datalake-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  spark-master:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: node-processing--spark-master
+    user: root
+    env_file: .env
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - PYSPARK_PYTHON=/opt/conda/bin/python3
+      - PYSPARK_DRIVER_PYTHON=/opt/conda/bin/python3
+    entrypoint: ["/usr/local/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+                 "--host", "spark-master", "--port", "7077", "--webui-port", "8081"]
+    volumes:
+      - ./scripts:/home/jovyan/scripts
+      - ./config/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+      - ./jars:/opt/spark-extra-jars
+    ports:
+      - "7077:7077"
+      - "8081:8081"
+    networks:
+      - datalake-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  jupyterlab:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: node-processing--jupyter
+    user: root
+    env_file: .env
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      - GRANT_SUDO=yes
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - PYSPARK_PYTHON=/opt/conda/bin/python3
+      - PYSPARK_DRIVER_PYTHON=/opt/conda/bin/python3
+    volumes:
+      - jupyter-work:/home/jovyan/work
+      - ./scripts:/home/jovyan/work/scripts
+      - ./jars:/opt/spark-extra-jars
+      - ./config/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+    ports:
+      - "8888:8888"
+    networks:
+      - datalake-net
+    depends_on:
+      - spark-master
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────────
+  #  NODE-SERVING
+  # ───────────────────────────────────────────────────────────────
+
+  spark-worker:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: node-serving--spark-worker
+    user: root
+    env_file: .env
+    environment:
+      - SPARK_WORKER_MEMORY=${SPARK_EXECUTOR_MEMORY}
+      - SPARK_WORKER_CORES=${SPARK_EXECUTOR_CORES}
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - PYSPARK_PYTHON=/opt/conda/bin/python3
+      - PYSPARK_DRIVER_PYTHON=/opt/conda/bin/python3
+    entrypoint: ["/usr/local/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+                 "--host", "spark-worker", "--webui-port", "8082",
+                 "spark://spark-master:7077"]
+    volumes:
+      - ./scripts:/home/jovyan/scripts
+      - ./config/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+      - ./jars:/opt/spark-extra-jars
+    ports:
+      - "8082:8082"
+    networks:
+      - datalake-net
+    depends_on:
+      - spark-master
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  trino:
+    image: trinodb/trino:426
+    container_name: node-serving--trino
+    volumes:
+      - ./config/trino/catalog:/etc/trino/catalog
+    ports:
+      - "8090:8080"
+    networks:
+      - datalake-net
+    depends_on:
+      - hive-metastore
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  cloudbeaver:
+    image: dbeaver/cloudbeaver:latest
+    container_name: node-serving--cloudbeaver
+    restart: unless-stopped
+    ports:
+      - "8978:8978"
+    volumes:
+      - cloudbeaver-data:/opt/cloudbeaver/workspace
+    networks:
+      - datalake-net
+    depends_on:
+      - trino
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ───────────────────────────────────────────────────────────────
+  #  INIT — Buckets MinIO
+  # ───────────────────────────────────────────────────────────────
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    env_file: .env
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - datalake-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set lake http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+        mc mb --ignore-existing lake/bronze &&
+        mc mb --ignore-existing lake/silver &&
+        mc mb --ignore-existing lake/gold &&
+        mc mb --ignore-existing lake/lineage &&
+        echo 'Buckets creados: bronze | silver | gold | lineage'
+
+  # ───────────────────────────────────────────────────────────────
+  #  LINEAGE API
+  # ───────────────────────────────────────────────────────────────
+
+  lineage-api:
+    build:
+      context: ./lineage_api
+      dockerfile: Dockerfile
+    container_name: node-lineage--api
+    restart: unless-stopped
+    ports:
+      - "8085:8085"
+    environment:
+      TRINO_HOST: trino
+      TRINO_PORT: 8080
+      TRINO_CATALOG: hive
+      TRINO_SCHEMA: lineage
+      API_PORT: 8085
+    networks:
+      - datalake-net
+    depends_on:
+      - trino
+      - hive-metastore
+
+  # ───────────────────────────────────────────────────────────────
+  #  LINEAGE FRONTEND
+  # ───────────────────────────────────────────────────────────────
+
+  lineage-frontend:
+    build:
+      context: ./lineage_frontend
+      dockerfile: Dockerfile
+    container_name: node-lineage--frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:8085
+    networks:
+      - datalake-net
+    depends_on:
+      - lineage-api
